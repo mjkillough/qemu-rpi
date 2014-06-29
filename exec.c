@@ -17,9 +17,7 @@
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 #include "config.h"
-#ifdef _WIN32
-#include <windows.h>
-#else
+#ifndef _WIN32
 #include <sys/types.h>
 #include <sys/mman.h>
 #endif
@@ -35,6 +33,7 @@
 #include "hw/xen/xen.h"
 #include "qemu/timer.h"
 #include "qemu/config-file.h"
+#include "qemu/error-report.h"
 #include "exec/memory.h"
 #include "sysemu/dma.h"
 #include "exec/address-spaces.h"
@@ -50,13 +49,14 @@
 #include "translate-all.h"
 
 #include "exec/memory-internal.h"
+#include "exec/ram_addr.h"
 
 #include "qemu/range.h"
 
 //#define DEBUG_SUBPAGE
 
 #if !defined(CONFIG_USER_ONLY)
-static int in_migration;
+static bool in_migration;
 
 RAMList ram_list = { .blocks = QTAILQ_HEAD_INITIALIZER(ram_list.blocks) };
 
@@ -68,6 +68,12 @@ AddressSpace address_space_memory;
 
 MemoryRegion io_mem_rom, io_mem_notdirty;
 static MemoryRegion io_mem_unassigned;
+
+/* RAM is pre-allocated and passed into qemu_ram_alloc_from_ptr */
+#define RAM_PREALLOC   (1 << 0)
+
+/* RAM is mmap-ed with MAP_SHARED */
+#define RAM_SHARED     (1 << 1)
 
 #endif
 
@@ -136,6 +142,7 @@ typedef struct subpage_t {
 
 static void io_mem_init(void);
 static void memory_map_init(void);
+static void tcg_commit(MemoryListener *listener);
 
 static MemoryRegion io_mem_watch;
 #endif
@@ -337,6 +344,18 @@ address_space_translate_internal(AddressSpaceDispatch *d, hwaddr addr, hwaddr *x
     return section;
 }
 
+static inline bool memory_access_is_direct(MemoryRegion *mr, bool is_write)
+{
+    if (memory_region_is_ram(mr)) {
+        return !(is_write && mr->readonly);
+    }
+    if (memory_region_is_romd(mr)) {
+        return !is_write;
+    }
+
+    return false;
+}
+
 MemoryRegion *address_space_translate(AddressSpace *as, hwaddr addr,
                                       hwaddr *xlat, hwaddr *plen,
                                       bool is_write)
@@ -364,6 +383,11 @@ MemoryRegion *address_space_translate(AddressSpace *as, hwaddr addr,
         }
 
         as = iotlb.target_as;
+    }
+
+    if (xen_enabled() && memory_access_is_direct(mr, is_write)) {
+        hwaddr page = ((addr & TARGET_PAGE_MASK) + TARGET_PAGE_SIZE) - addr;
+        len = MIN(page, len);
     }
 
     *plen = len;
@@ -401,7 +425,7 @@ static int cpu_common_post_load(void *opaque, int version_id)
     /* 0x01 was CPU_INTERRUPT_EXIT. This line can be removed when the
        version_id is increased. */
     cpu->interrupt_request &= ~0x01;
-    tlb_flush(cpu->env_ptr, 1);
+    tlb_flush(cpu, 1);
 
     return 0;
 }
@@ -410,9 +434,8 @@ const VMStateDescription vmstate_cpu_common = {
     .name = "cpu_common",
     .version_id = 1,
     .minimum_version_id = 1,
-    .minimum_version_id_old = 1,
     .post_load = cpu_common_post_load,
-    .fields      = (VMStateField []) {
+    .fields = (VMStateField[]) {
         VMSTATE_UINT32(halted, CPUState),
         VMSTATE_UINT32(interrupt_request, CPUState),
         VMSTATE_END_OF_LIST()
@@ -434,6 +457,22 @@ CPUState *qemu_get_cpu(int index)
     return NULL;
 }
 
+#if !defined(CONFIG_USER_ONLY)
+void tcg_cpu_address_space_init(CPUState *cpu, AddressSpace *as)
+{
+    /* We only support one address space per cpu at the moment.  */
+    assert(cpu->as == as);
+
+    if (cpu->tcg_as_listener) {
+        memory_listener_unregister(cpu->tcg_as_listener);
+    } else {
+        cpu->tcg_as_listener = g_new0(MemoryListener, 1);
+    }
+    cpu->tcg_as_listener->commit = tcg_commit;
+    memory_listener_register(cpu->tcg_as_listener, as);
+}
+#endif
+
 void cpu_exec_init(CPUArchState *env)
 {
     CPUState *cpu = ENV_GET_CPU(env);
@@ -450,9 +489,10 @@ void cpu_exec_init(CPUArchState *env)
     }
     cpu->cpu_index = cpu_index;
     cpu->numa_node = 0;
-    QTAILQ_INIT(&env->breakpoints);
-    QTAILQ_INIT(&env->watchpoints);
+    QTAILQ_INIT(&cpu->breakpoints);
+    QTAILQ_INIT(&cpu->watchpoints);
 #ifndef CONFIG_USER_ONLY
+    cpu->as = &address_space_memory;
     cpu->thread_id = qemu_get_thread_id();
 #endif
     QTAILQ_INSERT_TAIL(&cpus, cpu, node);
@@ -484,36 +524,37 @@ static void breakpoint_invalidate(CPUState *cpu, target_ulong pc)
 {
     hwaddr phys = cpu_get_phys_page_debug(cpu, pc);
     if (phys != -1) {
-        tb_invalidate_phys_addr(phys | (pc & ~TARGET_PAGE_MASK));
+        tb_invalidate_phys_addr(cpu->as,
+                                phys | (pc & ~TARGET_PAGE_MASK));
     }
 }
 #endif
 #endif /* TARGET_HAS_ICE */
 
 #if defined(CONFIG_USER_ONLY)
-void cpu_watchpoint_remove_all(CPUArchState *env, int mask)
+void cpu_watchpoint_remove_all(CPUState *cpu, int mask)
 
 {
 }
 
-int cpu_watchpoint_insert(CPUArchState *env, target_ulong addr, target_ulong len,
+int cpu_watchpoint_insert(CPUState *cpu, vaddr addr, vaddr len,
                           int flags, CPUWatchpoint **watchpoint)
 {
     return -ENOSYS;
 }
 #else
 /* Add a watchpoint.  */
-int cpu_watchpoint_insert(CPUArchState *env, target_ulong addr, target_ulong len,
+int cpu_watchpoint_insert(CPUState *cpu, vaddr addr, vaddr len,
                           int flags, CPUWatchpoint **watchpoint)
 {
-    target_ulong len_mask = ~(len - 1);
+    vaddr len_mask = ~(len - 1);
     CPUWatchpoint *wp;
 
     /* sanity checks: allow power-of-2 lengths, deny unaligned watchpoints */
     if ((len & (len - 1)) || (addr & ~len_mask) ||
             len == 0 || len > TARGET_PAGE_SIZE) {
-        fprintf(stderr, "qemu: tried to set invalid watchpoint at "
-                TARGET_FMT_lx ", len=" TARGET_FMT_lu "\n", addr, len);
+        error_report("tried to set invalid watchpoint at %"
+                     VADDR_PRIx ", len=%" VADDR_PRIu, addr, len);
         return -EINVAL;
     }
     wp = g_malloc(sizeof(*wp));
@@ -523,12 +564,13 @@ int cpu_watchpoint_insert(CPUArchState *env, target_ulong addr, target_ulong len
     wp->flags = flags;
 
     /* keep all GDB-injected watchpoints in front */
-    if (flags & BP_GDB)
-        QTAILQ_INSERT_HEAD(&env->watchpoints, wp, entry);
-    else
-        QTAILQ_INSERT_TAIL(&env->watchpoints, wp, entry);
+    if (flags & BP_GDB) {
+        QTAILQ_INSERT_HEAD(&cpu->watchpoints, wp, entry);
+    } else {
+        QTAILQ_INSERT_TAIL(&cpu->watchpoints, wp, entry);
+    }
 
-    tlb_flush_page(env, addr);
+    tlb_flush_page(cpu, addr);
 
     if (watchpoint)
         *watchpoint = wp;
@@ -536,16 +578,16 @@ int cpu_watchpoint_insert(CPUArchState *env, target_ulong addr, target_ulong len
 }
 
 /* Remove a specific watchpoint.  */
-int cpu_watchpoint_remove(CPUArchState *env, target_ulong addr, target_ulong len,
+int cpu_watchpoint_remove(CPUState *cpu, vaddr addr, vaddr len,
                           int flags)
 {
-    target_ulong len_mask = ~(len - 1);
+    vaddr len_mask = ~(len - 1);
     CPUWatchpoint *wp;
 
-    QTAILQ_FOREACH(wp, &env->watchpoints, entry) {
+    QTAILQ_FOREACH(wp, &cpu->watchpoints, entry) {
         if (addr == wp->vaddr && len_mask == wp->len_mask
                 && flags == (wp->flags & ~BP_WATCHPOINT_HIT)) {
-            cpu_watchpoint_remove_by_ref(env, wp);
+            cpu_watchpoint_remove_by_ref(cpu, wp);
             return 0;
         }
     }
@@ -553,29 +595,30 @@ int cpu_watchpoint_remove(CPUArchState *env, target_ulong addr, target_ulong len
 }
 
 /* Remove a specific watchpoint by reference.  */
-void cpu_watchpoint_remove_by_ref(CPUArchState *env, CPUWatchpoint *watchpoint)
+void cpu_watchpoint_remove_by_ref(CPUState *cpu, CPUWatchpoint *watchpoint)
 {
-    QTAILQ_REMOVE(&env->watchpoints, watchpoint, entry);
+    QTAILQ_REMOVE(&cpu->watchpoints, watchpoint, entry);
 
-    tlb_flush_page(env, watchpoint->vaddr);
+    tlb_flush_page(cpu, watchpoint->vaddr);
 
     g_free(watchpoint);
 }
 
 /* Remove all matching watchpoints.  */
-void cpu_watchpoint_remove_all(CPUArchState *env, int mask)
+void cpu_watchpoint_remove_all(CPUState *cpu, int mask)
 {
     CPUWatchpoint *wp, *next;
 
-    QTAILQ_FOREACH_SAFE(wp, &env->watchpoints, entry, next) {
-        if (wp->flags & mask)
-            cpu_watchpoint_remove_by_ref(env, wp);
+    QTAILQ_FOREACH_SAFE(wp, &cpu->watchpoints, entry, next) {
+        if (wp->flags & mask) {
+            cpu_watchpoint_remove_by_ref(cpu, wp);
+        }
     }
 }
 #endif
 
 /* Add a breakpoint.  */
-int cpu_breakpoint_insert(CPUArchState *env, target_ulong pc, int flags,
+int cpu_breakpoint_insert(CPUState *cpu, vaddr pc, int flags,
                           CPUBreakpoint **breakpoint)
 {
 #if defined(TARGET_HAS_ICE)
@@ -588,12 +631,12 @@ int cpu_breakpoint_insert(CPUArchState *env, target_ulong pc, int flags,
 
     /* keep all GDB-injected breakpoints in front */
     if (flags & BP_GDB) {
-        QTAILQ_INSERT_HEAD(&env->breakpoints, bp, entry);
+        QTAILQ_INSERT_HEAD(&cpu->breakpoints, bp, entry);
     } else {
-        QTAILQ_INSERT_TAIL(&env->breakpoints, bp, entry);
+        QTAILQ_INSERT_TAIL(&cpu->breakpoints, bp, entry);
     }
 
-    breakpoint_invalidate(ENV_GET_CPU(env), pc);
+    breakpoint_invalidate(cpu, pc);
 
     if (breakpoint) {
         *breakpoint = bp;
@@ -605,14 +648,14 @@ int cpu_breakpoint_insert(CPUArchState *env, target_ulong pc, int flags,
 }
 
 /* Remove a specific breakpoint.  */
-int cpu_breakpoint_remove(CPUArchState *env, target_ulong pc, int flags)
+int cpu_breakpoint_remove(CPUState *cpu, vaddr pc, int flags)
 {
 #if defined(TARGET_HAS_ICE)
     CPUBreakpoint *bp;
 
-    QTAILQ_FOREACH(bp, &env->breakpoints, entry) {
+    QTAILQ_FOREACH(bp, &cpu->breakpoints, entry) {
         if (bp->pc == pc && bp->flags == flags) {
-            cpu_breakpoint_remove_by_ref(env, bp);
+            cpu_breakpoint_remove_by_ref(cpu, bp);
             return 0;
         }
     }
@@ -623,26 +666,27 @@ int cpu_breakpoint_remove(CPUArchState *env, target_ulong pc, int flags)
 }
 
 /* Remove a specific breakpoint by reference.  */
-void cpu_breakpoint_remove_by_ref(CPUArchState *env, CPUBreakpoint *breakpoint)
+void cpu_breakpoint_remove_by_ref(CPUState *cpu, CPUBreakpoint *breakpoint)
 {
 #if defined(TARGET_HAS_ICE)
-    QTAILQ_REMOVE(&env->breakpoints, breakpoint, entry);
+    QTAILQ_REMOVE(&cpu->breakpoints, breakpoint, entry);
 
-    breakpoint_invalidate(ENV_GET_CPU(env), breakpoint->pc);
+    breakpoint_invalidate(cpu, breakpoint->pc);
 
     g_free(breakpoint);
 #endif
 }
 
 /* Remove all matching breakpoints. */
-void cpu_breakpoint_remove_all(CPUArchState *env, int mask)
+void cpu_breakpoint_remove_all(CPUState *cpu, int mask)
 {
 #if defined(TARGET_HAS_ICE)
     CPUBreakpoint *bp, *next;
 
-    QTAILQ_FOREACH_SAFE(bp, &env->breakpoints, entry, next) {
-        if (bp->flags & mask)
-            cpu_breakpoint_remove_by_ref(env, bp);
+    QTAILQ_FOREACH_SAFE(bp, &cpu->breakpoints, entry, next) {
+        if (bp->flags & mask) {
+            cpu_breakpoint_remove_by_ref(cpu, bp);
+        }
     }
 #endif
 }
@@ -666,9 +710,8 @@ void cpu_single_step(CPUState *cpu, int enabled)
 #endif
 }
 
-void cpu_abort(CPUArchState *env, const char *fmt, ...)
+void cpu_abort(CPUState *cpu, const char *fmt, ...)
 {
-    CPUState *cpu = ENV_GET_CPU(env);
     va_list ap;
     va_list ap2;
 
@@ -723,11 +766,14 @@ found:
     return block;
 }
 
-static void tlb_reset_dirty_range_all(ram_addr_t start, ram_addr_t end,
-                                      uintptr_t length)
+static void tlb_reset_dirty_range_all(ram_addr_t start, ram_addr_t length)
 {
-    RAMBlock *block;
     ram_addr_t start1;
+    RAMBlock *block;
+    ram_addr_t end;
+
+    end = TARGET_PAGE_ALIGN(start + length);
+    start &= TARGET_PAGE_MASK;
 
     block = qemu_get_ram_block(start);
     assert(block == qemu_get_ram_block(end - 1));
@@ -736,32 +782,24 @@ static void tlb_reset_dirty_range_all(ram_addr_t start, ram_addr_t end,
 }
 
 /* Note: start and end must be within the same ram block.  */
-void cpu_physical_memory_reset_dirty(ram_addr_t start, ram_addr_t end,
-                                     int dirty_flags)
+void cpu_physical_memory_reset_dirty(ram_addr_t start, ram_addr_t length,
+                                     unsigned client)
 {
-    uintptr_t length;
-
-    start &= TARGET_PAGE_MASK;
-    end = TARGET_PAGE_ALIGN(end);
-
-    length = end - start;
     if (length == 0)
         return;
-    cpu_physical_memory_mask_dirty_range(start, length, dirty_flags);
+    cpu_physical_memory_clear_dirty_range(start, length, client);
 
     if (tcg_enabled()) {
-        tlb_reset_dirty_range_all(start, end, length);
+        tlb_reset_dirty_range_all(start, length);
     }
 }
 
-static int cpu_physical_memory_set_dirty_tracking(int enable)
+static void cpu_physical_memory_set_dirty_tracking(bool enable)
 {
-    int ret = 0;
     in_migration = enable;
-    return ret;
 }
 
-hwaddr memory_region_section_get_iotlb(CPUArchState *env,
+hwaddr memory_region_section_get_iotlb(CPUState *cpu,
                                        MemoryRegionSection *section,
                                        target_ulong vaddr,
                                        hwaddr paddr, hwaddr xlat,
@@ -781,13 +819,13 @@ hwaddr memory_region_section_get_iotlb(CPUArchState *env,
             iotlb |= PHYS_SECTION_ROM;
         }
     } else {
-        iotlb = section - address_space_memory.dispatch->map.sections;
+        iotlb = section - section->address_space->dispatch->map.sections;
         iotlb += xlat;
     }
 
     /* Make accesses to pages with watchpoints go via the
        watchpoint trap routines.  */
-    QTAILQ_FOREACH(wp, &env->watchpoints, entry) {
+    QTAILQ_FOREACH(wp, &cpu->watchpoints, entry) {
         if (vaddr == (wp->vaddr & TARGET_PAGE_MASK)) {
             /* Avoid trapping reads of pages with a write breakpoint. */
             if ((prot & PAGE_WRITE) || (wp->flags & BP_MEM_READ)) {
@@ -877,6 +915,7 @@ static void register_subpage(AddressSpaceDispatch *d, MemoryRegionSection *secti
 
     if (!(existing->mr->subpage)) {
         subpage = subpage_init(d->as, base);
+        subsection.address_space = d->as;
         subsection.mr = &subpage->iomem;
         phys_page_set(d, base >> TARGET_PAGE_BITS, 1,
                       phys_section_add(&d->map, &subsection));
@@ -977,16 +1016,10 @@ static long gethugepagesize(const char *path)
     return fs.f_bsize;
 }
 
-static sigjmp_buf sigjump;
-
-static void sigbus_handler(int signal)
-{
-    siglongjmp(sigjump, 1);
-}
-
 static void *file_ram_alloc(RAMBlock *block,
                             ram_addr_t memory,
-                            const char *path)
+                            const char *path,
+                            Error **errp)
 {
     char *filename;
     char *sanitized_name;
@@ -997,7 +1030,7 @@ static void *file_ram_alloc(RAMBlock *block,
 
     hpagesize = gethugepagesize(path);
     if (!hpagesize) {
-        return NULL;
+        goto error;
     }
 
     if (memory < hpagesize) {
@@ -1005,8 +1038,9 @@ static void *file_ram_alloc(RAMBlock *block,
     }
 
     if (kvm_enabled() && !kvm_has_sync_mmu()) {
-        fprintf(stderr, "host lacks kvm mmu notifiers, -mem-path unsupported\n");
-        return NULL;
+        error_setg(errp,
+                   "host lacks kvm mmu notifiers, -mem-path unsupported");
+        goto error;
     }
 
     /* Make name safe to use with mkstemp by replacing '/' with '_'. */
@@ -1022,9 +1056,10 @@ static void *file_ram_alloc(RAMBlock *block,
 
     fd = mkstemp(filename);
     if (fd < 0) {
-        perror("unable to create backing store for hugepages");
+        error_setg_errno(errp, errno,
+                         "unable to create backing store for hugepages");
         g_free(filename);
-        return NULL;
+        goto error;
     }
     unlink(filename);
     g_free(filename);
@@ -1037,65 +1072,32 @@ static void *file_ram_alloc(RAMBlock *block,
      * If anything goes wrong with it under other filesystems,
      * mmap will fail.
      */
-    if (ftruncate(fd, memory))
+    if (ftruncate(fd, memory)) {
         perror("ftruncate");
+    }
 
-    area = mmap(0, memory, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    area = mmap(0, memory, PROT_READ | PROT_WRITE,
+                (block->flags & RAM_SHARED ? MAP_SHARED : MAP_PRIVATE),
+                fd, 0);
     if (area == MAP_FAILED) {
-        perror("file_ram_alloc: can't mmap RAM pages");
+        error_setg_errno(errp, errno,
+                         "unable to map backing store for hugepages");
         close(fd);
-        return (NULL);
+        goto error;
     }
 
     if (mem_prealloc) {
-        int ret, i;
-        struct sigaction act, oldact;
-        sigset_t set, oldset;
-
-        memset(&act, 0, sizeof(act));
-        act.sa_handler = &sigbus_handler;
-        act.sa_flags = 0;
-
-        ret = sigaction(SIGBUS, &act, &oldact);
-        if (ret) {
-            perror("file_ram_alloc: failed to install signal handler");
-            exit(1);
-        }
-
-        /* unblock SIGBUS */
-        sigemptyset(&set);
-        sigaddset(&set, SIGBUS);
-        pthread_sigmask(SIG_UNBLOCK, &set, &oldset);
-
-        if (sigsetjmp(sigjump, 1)) {
-            fprintf(stderr, "file_ram_alloc: failed to preallocate pages\n");
-            exit(1);
-        }
-
-        /* MAP_POPULATE silently ignores failures */
-        for (i = 0; i < (memory/hpagesize)-1; i++) {
-            memset(area + (hpagesize*i), 0, 1);
-        }
-
-        ret = sigaction(SIGBUS, &oldact, NULL);
-        if (ret) {
-            perror("file_ram_alloc: failed to reinstall signal handler");
-            exit(1);
-        }
-
-        pthread_sigmask(SIG_SETMASK, &oldset, NULL);
+        os_mem_prealloc(fd, area, memory);
     }
 
     block->fd = fd;
     return area;
-}
-#else
-static void *file_ram_alloc(RAMBlock *block,
-                            ram_addr_t memory,
-                            const char *path)
-{
-    fprintf(stderr, "-mem-path not supported on this host\n");
-    exit(1);
+
+error:
+    if (mem_prealloc) {
+        exit(1);
+    }
+    return NULL;
 }
 #endif
 
@@ -1161,17 +1163,24 @@ static void qemu_ram_setup_dump(void *addr, ram_addr_t size)
     }
 }
 
-void qemu_ram_set_idstr(ram_addr_t addr, const char *name, DeviceState *dev)
+static RAMBlock *find_ram_block(ram_addr_t addr)
 {
-    RAMBlock *new_block, *block;
+    RAMBlock *block;
 
-    new_block = NULL;
     QTAILQ_FOREACH(block, &ram_list.blocks, next) {
         if (block->offset == addr) {
-            new_block = block;
-            break;
+            return block;
         }
     }
+
+    return NULL;
+}
+
+void qemu_ram_set_idstr(ram_addr_t addr, const char *name, DeviceState *dev)
+{
+    RAMBlock *new_block = find_ram_block(addr);
+    RAMBlock *block;
+
     assert(new_block);
     assert(!new_block->idstr[0]);
 
@@ -1196,6 +1205,15 @@ void qemu_ram_set_idstr(ram_addr_t addr, const char *name, DeviceState *dev)
     qemu_mutex_unlock_ramlist();
 }
 
+void qemu_ram_unset_idstr(ram_addr_t addr)
+{
+    RAMBlock *block = find_ram_block(addr);
+
+    if (block) {
+        memset(block->idstr, 0, sizeof(block->idstr));
+    }
+}
+
 static int memory_try_enable_merging(void *addr, size_t len)
 {
     if (!qemu_opt_get_bool(qemu_get_machine_opts(), "mem-merge", true)) {
@@ -1206,53 +1224,30 @@ static int memory_try_enable_merging(void *addr, size_t len)
     return qemu_madvise(addr, len, QEMU_MADV_MERGEABLE);
 }
 
-ram_addr_t qemu_ram_alloc_from_ptr(ram_addr_t size, void *host,
-                                   MemoryRegion *mr)
+static ram_addr_t ram_block_add(RAMBlock *new_block)
 {
-    RAMBlock *block, *new_block;
+    RAMBlock *block;
+    ram_addr_t old_ram_size, new_ram_size;
 
-    size = TARGET_PAGE_ALIGN(size);
-    new_block = g_malloc0(sizeof(*new_block));
-    new_block->fd = -1;
+    old_ram_size = last_ram_offset() >> TARGET_PAGE_BITS;
 
     /* This assumes the iothread lock is taken here too.  */
     qemu_mutex_lock_ramlist();
-    new_block->mr = mr;
-    new_block->offset = find_ram_offset(size);
-    if (host) {
-        new_block->host = host;
-        new_block->flags |= RAM_PREALLOC_MASK;
-    } else if (xen_enabled()) {
-        if (mem_path) {
-            fprintf(stderr, "-mem-path not supported with Xen\n");
-            exit(1);
-        }
-        xen_ram_alloc(new_block->offset, size, mr);
-    } else {
-        if (mem_path) {
-            if (phys_mem_alloc != qemu_anon_ram_alloc) {
-                /*
-                 * file_ram_alloc() needs to allocate just like
-                 * phys_mem_alloc, but we haven't bothered to provide
-                 * a hook there.
-                 */
-                fprintf(stderr,
-                        "-mem-path not supported with this accelerator\n");
-                exit(1);
-            }
-            new_block->host = file_ram_alloc(new_block, size, mem_path);
-        }
-        if (!new_block->host) {
-            new_block->host = phys_mem_alloc(size);
+    new_block->offset = find_ram_offset(new_block->length);
+
+    if (!new_block->host) {
+        if (xen_enabled()) {
+            xen_ram_alloc(new_block->offset, new_block->length, new_block->mr);
+        } else {
+            new_block->host = phys_mem_alloc(new_block->length);
             if (!new_block->host) {
                 fprintf(stderr, "Cannot set up guest memory '%s': %s\n",
                         new_block->mr->name, strerror(errno));
                 exit(1);
             }
-            memory_try_enable_merging(new_block->host, size);
+            memory_try_enable_merging(new_block->host, new_block->length);
         }
     }
-    new_block->length = size;
 
     /* Keep the list sorted from biggest to smallest block.  */
     QTAILQ_FOREACH(block, &ram_list.blocks, next) {
@@ -1270,20 +1265,83 @@ ram_addr_t qemu_ram_alloc_from_ptr(ram_addr_t size, void *host,
     ram_list.version++;
     qemu_mutex_unlock_ramlist();
 
-    ram_list.phys_dirty = g_realloc(ram_list.phys_dirty,
-                                       last_ram_offset() >> TARGET_PAGE_BITS);
-    memset(ram_list.phys_dirty + (new_block->offset >> TARGET_PAGE_BITS),
-           0, size >> TARGET_PAGE_BITS);
-    cpu_physical_memory_set_dirty_range(new_block->offset, size, 0xff);
+    new_ram_size = last_ram_offset() >> TARGET_PAGE_BITS;
 
-    qemu_ram_setup_dump(new_block->host, size);
-    qemu_madvise(new_block->host, size, QEMU_MADV_HUGEPAGE);
-    qemu_madvise(new_block->host, size, QEMU_MADV_DONTFORK);
+    if (new_ram_size > old_ram_size) {
+        int i;
+        for (i = 0; i < DIRTY_MEMORY_NUM; i++) {
+            ram_list.dirty_memory[i] =
+                bitmap_zero_extend(ram_list.dirty_memory[i],
+                                   old_ram_size, new_ram_size);
+       }
+    }
+    cpu_physical_memory_set_dirty_range(new_block->offset, new_block->length);
 
-    if (kvm_enabled())
-        kvm_setup_guest_memory(new_block->host, size);
+    qemu_ram_setup_dump(new_block->host, new_block->length);
+    qemu_madvise(new_block->host, new_block->length, QEMU_MADV_HUGEPAGE);
+    qemu_madvise(new_block->host, new_block->length, QEMU_MADV_DONTFORK);
+
+    if (kvm_enabled()) {
+        kvm_setup_guest_memory(new_block->host, new_block->length);
+    }
 
     return new_block->offset;
+}
+
+#ifdef __linux__
+ram_addr_t qemu_ram_alloc_from_file(ram_addr_t size, MemoryRegion *mr,
+                                    bool share, const char *mem_path,
+                                    Error **errp)
+{
+    RAMBlock *new_block;
+
+    if (xen_enabled()) {
+        error_setg(errp, "-mem-path not supported with Xen");
+        return -1;
+    }
+
+    if (phys_mem_alloc != qemu_anon_ram_alloc) {
+        /*
+         * file_ram_alloc() needs to allocate just like
+         * phys_mem_alloc, but we haven't bothered to provide
+         * a hook there.
+         */
+        error_setg(errp,
+                   "-mem-path not supported with this accelerator");
+        return -1;
+    }
+
+    size = TARGET_PAGE_ALIGN(size);
+    new_block = g_malloc0(sizeof(*new_block));
+    new_block->mr = mr;
+    new_block->length = size;
+    new_block->flags = share ? RAM_SHARED : 0;
+    new_block->host = file_ram_alloc(new_block, size,
+                                     mem_path, errp);
+    if (!new_block->host) {
+        g_free(new_block);
+        return -1;
+    }
+
+    return ram_block_add(new_block);
+}
+#endif
+
+ram_addr_t qemu_ram_alloc_from_ptr(ram_addr_t size, void *host,
+                                   MemoryRegion *mr)
+{
+    RAMBlock *new_block;
+
+    size = TARGET_PAGE_ALIGN(size);
+    new_block = g_malloc0(sizeof(*new_block));
+    new_block->mr = mr;
+    new_block->length = size;
+    new_block->fd = -1;
+    new_block->host = host;
+    if (host) {
+        new_block->flags |= RAM_PREALLOC;
+    }
+    return ram_block_add(new_block);
 }
 
 ram_addr_t qemu_ram_alloc(ram_addr_t size, MemoryRegion *mr)
@@ -1320,7 +1378,7 @@ void qemu_ram_free(ram_addr_t addr)
             QTAILQ_REMOVE(&ram_list.blocks, block, next);
             ram_list.mru_block = NULL;
             ram_list.version++;
-            if (block->flags & RAM_PREALLOC_MASK) {
+            if (block->flags & RAM_PREALLOC) {
                 ;
             } else if (xen_enabled()) {
                 xen_invalidate_map_cache_entry(block->host);
@@ -1352,7 +1410,7 @@ void qemu_ram_remap(ram_addr_t addr, ram_addr_t length)
         offset = addr - block->offset;
         if (offset < block->length) {
             vaddr = block->host + offset;
-            if (block->flags & RAM_PREALLOC_MASK) {
+            if (block->flags & RAM_PREALLOC) {
                 ;
             } else if (xen_enabled()) {
                 abort();
@@ -1360,12 +1418,8 @@ void qemu_ram_remap(ram_addr_t addr, ram_addr_t length)
                 flags = MAP_FIXED;
                 munmap(vaddr, length);
                 if (block->fd >= 0) {
-#ifdef MAP_POPULATE
-                    flags |= mem_prealloc ? MAP_POPULATE | MAP_SHARED :
-                        MAP_PRIVATE;
-#else
-                    flags |= MAP_PRIVATE;
-#endif
+                    flags |= (block->flags & RAM_SHARED ?
+                              MAP_SHARED : MAP_PRIVATE);
                     area = mmap(vaddr, length, PROT_READ | PROT_WRITE,
                                 flags, block->fd, offset);
                 } else {
@@ -1394,6 +1448,20 @@ void qemu_ram_remap(ram_addr_t addr, ram_addr_t length)
     }
 }
 #endif /* !_WIN32 */
+
+int qemu_get_ram_fd(ram_addr_t addr)
+{
+    RAMBlock *block = qemu_get_ram_block(addr);
+
+    return block->fd;
+}
+
+void *qemu_get_ram_block_host_ptr(ram_addr_t addr)
+{
+    RAMBlock *block = qemu_get_ram_block(addr);
+
+    return block->host;
+}
 
 /* Return a host pointer to ram allocated with qemu_ram_alloc.
    With the exception of the softmmu code in this file, this should
@@ -1484,11 +1552,8 @@ found:
 static void notdirty_mem_write(void *opaque, hwaddr ram_addr,
                                uint64_t val, unsigned size)
 {
-    int dirty_flags;
-    dirty_flags = cpu_physical_memory_get_dirty_flags(ram_addr);
-    if (!(dirty_flags & CODE_DIRTY_FLAG)) {
+    if (!cpu_physical_memory_get_dirty_flag(ram_addr, DIRTY_MEMORY_CODE)) {
         tb_invalidate_phys_page_fast(ram_addr, size);
-        dirty_flags = cpu_physical_memory_get_dirty_flags(ram_addr);
     }
     switch (size) {
     case 1:
@@ -1503,13 +1568,13 @@ static void notdirty_mem_write(void *opaque, hwaddr ram_addr,
     default:
         abort();
     }
-    dirty_flags |= (0xff & ~CODE_DIRTY_FLAG);
-    cpu_physical_memory_set_dirty_flags(ram_addr, dirty_flags);
+    cpu_physical_memory_set_dirty_flag(ram_addr, DIRTY_MEMORY_MIGRATION);
+    cpu_physical_memory_set_dirty_flag(ram_addr, DIRTY_MEMORY_VGA);
     /* we remove the notdirty callback only if the code has been
        flushed */
-    if (dirty_flags == 0xff) {
+    if (!cpu_physical_memory_is_clean(ram_addr)) {
         CPUArchState *env = current_cpu->env_ptr;
-        tlb_set_dirty(env, env->mem_io_vaddr);
+        tlb_set_dirty(env, current_cpu->mem_io_vaddr);
     }
 }
 
@@ -1528,34 +1593,35 @@ static const MemoryRegionOps notdirty_mem_ops = {
 /* Generate a debug exception if a watchpoint has been hit.  */
 static void check_watchpoint(int offset, int len_mask, int flags)
 {
-    CPUArchState *env = current_cpu->env_ptr;
+    CPUState *cpu = current_cpu;
+    CPUArchState *env = cpu->env_ptr;
     target_ulong pc, cs_base;
     target_ulong vaddr;
     CPUWatchpoint *wp;
     int cpu_flags;
 
-    if (env->watchpoint_hit) {
+    if (cpu->watchpoint_hit) {
         /* We re-entered the check after replacing the TB. Now raise
          * the debug interrupt so that is will trigger after the
          * current instruction. */
-        cpu_interrupt(ENV_GET_CPU(env), CPU_INTERRUPT_DEBUG);
+        cpu_interrupt(cpu, CPU_INTERRUPT_DEBUG);
         return;
     }
-    vaddr = (env->mem_io_vaddr & TARGET_PAGE_MASK) + offset;
-    QTAILQ_FOREACH(wp, &env->watchpoints, entry) {
+    vaddr = (cpu->mem_io_vaddr & TARGET_PAGE_MASK) + offset;
+    QTAILQ_FOREACH(wp, &cpu->watchpoints, entry) {
         if ((vaddr == (wp->vaddr & len_mask) ||
              (vaddr & wp->len_mask) == wp->vaddr) && (wp->flags & flags)) {
             wp->flags |= BP_WATCHPOINT_HIT;
-            if (!env->watchpoint_hit) {
-                env->watchpoint_hit = wp;
-                tb_check_watchpoint(env);
+            if (!cpu->watchpoint_hit) {
+                cpu->watchpoint_hit = wp;
+                tb_check_watchpoint(cpu);
                 if (wp->flags & BP_STOP_BEFORE_ACCESS) {
-                    env->exception_index = EXCP_DEBUG;
-                    cpu_loop_exit(env);
+                    cpu->exception_index = EXCP_DEBUG;
+                    cpu_loop_exit(cpu);
                 } else {
                     cpu_get_tb_cpu_state(env, &pc, &cs_base, &cpu_flags);
-                    tb_gen_code(env, pc, cs_base, cpu_flags, 1);
-                    cpu_resume_from_signal(env, NULL);
+                    tb_gen_code(cpu, pc, cs_base, cpu_flags, 1);
+                    cpu_resume_from_signal(cpu, NULL);
                 }
             }
         } else {
@@ -1572,9 +1638,9 @@ static uint64_t watch_mem_read(void *opaque, hwaddr addr,
 {
     check_watchpoint(addr & ~TARGET_PAGE_MASK, ~(size - 1), BP_MEM_READ);
     switch (size) {
-    case 1: return ldub_phys(addr);
-    case 2: return lduw_phys(addr);
-    case 4: return ldl_phys(addr);
+    case 1: return ldub_phys(&address_space_memory, addr);
+    case 2: return lduw_phys(&address_space_memory, addr);
+    case 4: return ldl_phys(&address_space_memory, addr);
     default: abort();
     }
 }
@@ -1585,13 +1651,13 @@ static void watch_mem_write(void *opaque, hwaddr addr,
     check_watchpoint(addr & ~TARGET_PAGE_MASK, ~(size - 1), BP_MEM_WRITE);
     switch (size) {
     case 1:
-        stb_phys(addr, val);
+        stb_phys(&address_space_memory, addr, val);
         break;
     case 2:
-        stw_phys(addr, val);
+        stw_phys(&address_space_memory, addr, val);
         break;
     case 4:
-        stl_phys(addr, val);
+        stl_phys(&address_space_memory, addr, val);
         break;
     default: abort();
     }
@@ -1713,9 +1779,12 @@ static subpage_t *subpage_init(AddressSpace *as, hwaddr base)
     return mmio;
 }
 
-static uint16_t dummy_section(PhysPageMap *map, MemoryRegion *mr)
+static uint16_t dummy_section(PhysPageMap *map, AddressSpace *as,
+                              MemoryRegion *mr)
 {
+    assert(as);
     MemoryRegionSection section = {
+        .address_space = as,
         .mr = mr,
         .offset_within_address_space = 0,
         .offset_within_region = 0,
@@ -1725,10 +1794,9 @@ static uint16_t dummy_section(PhysPageMap *map, MemoryRegion *mr)
     return phys_section_add(map, &section);
 }
 
-MemoryRegion *iotlb_to_region(hwaddr index)
+MemoryRegion *iotlb_to_region(AddressSpace *as, hwaddr index)
 {
-    return address_space_memory.dispatch->map.sections[
-           index & ~TARGET_PAGE_MASK].mr;
+    return as->dispatch->map.sections[index & ~TARGET_PAGE_MASK].mr;
 }
 
 static void io_mem_init(void)
@@ -1748,13 +1816,13 @@ static void mem_begin(MemoryListener *listener)
     AddressSpaceDispatch *d = g_new0(AddressSpaceDispatch, 1);
     uint16_t n;
 
-    n = dummy_section(&d->map, &io_mem_unassigned);
+    n = dummy_section(&d->map, as, &io_mem_unassigned);
     assert(n == PHYS_SECTION_UNASSIGNED);
-    n = dummy_section(&d->map, &io_mem_notdirty);
+    n = dummy_section(&d->map, as, &io_mem_notdirty);
     assert(n == PHYS_SECTION_NOTDIRTY);
-    n = dummy_section(&d->map, &io_mem_rom);
+    n = dummy_section(&d->map, as, &io_mem_rom);
     assert(n == PHYS_SECTION_ROM);
-    n = dummy_section(&d->map, &io_mem_watch);
+    n = dummy_section(&d->map, as, &io_mem_watch);
     assert(n == PHYS_SECTION_WATCH);
 
     d->phys_map  = (PhysPageEntry) { .ptr = PHYS_MAP_NODE_NIL, .skip = 1 };
@@ -1786,30 +1854,29 @@ static void tcg_commit(MemoryListener *listener)
        reset the modified entries */
     /* XXX: slow ! */
     CPU_FOREACH(cpu) {
-        CPUArchState *env = cpu->env_ptr;
-
-        tlb_flush(env, 1);
+        /* FIXME: Disentangle the cpu.h circular files deps so we can
+           directly get the right CPU from listener.  */
+        if (cpu->tcg_as_listener != listener) {
+            continue;
+        }
+        tlb_flush(cpu, 1);
     }
 }
 
 static void core_log_global_start(MemoryListener *listener)
 {
-    cpu_physical_memory_set_dirty_tracking(1);
+    cpu_physical_memory_set_dirty_tracking(true);
 }
 
 static void core_log_global_stop(MemoryListener *listener)
 {
-    cpu_physical_memory_set_dirty_tracking(0);
+    cpu_physical_memory_set_dirty_tracking(false);
 }
 
 static MemoryListener core_memory_listener = {
     .log_global_start = core_log_global_start,
     .log_global_stop = core_log_global_stop,
     .priority = 1,
-};
-
-static MemoryListener tcg_memory_listener = {
-    .commit = tcg_commit,
 };
 
 void address_space_init_dispatch(AddressSpace *as)
@@ -1847,9 +1914,6 @@ static void memory_map_init(void)
     address_space_init(&address_space_io, system_io, "I/O");
 
     memory_listener_register(&core_memory_listener, &address_space_memory);
-    if (tcg_enabled()) {
-        memory_listener_register(&tcg_memory_listener, &address_space_memory);
-    }
 }
 
 MemoryRegion *get_system_memory(void)
@@ -1910,25 +1974,14 @@ int cpu_memory_rw_debug(CPUState *cpu, target_ulong addr,
 static void invalidate_and_set_dirty(hwaddr addr,
                                      hwaddr length)
 {
-    if (!cpu_physical_memory_is_dirty(addr)) {
+    if (cpu_physical_memory_is_clean(addr)) {
         /* invalidate code */
         tb_invalidate_phys_page_range(addr, addr + length, 0);
         /* set dirty bit */
-        cpu_physical_memory_set_dirty_flags(addr, (0xff & ~CODE_DIRTY_FLAG));
+        cpu_physical_memory_set_dirty_flag(addr, DIRTY_MEMORY_VGA);
+        cpu_physical_memory_set_dirty_flag(addr, DIRTY_MEMORY_MIGRATION);
     }
     xen_modified_memory(addr, length);
-}
-
-static inline bool memory_access_is_direct(MemoryRegion *mr, bool is_write)
-{
-    if (memory_region_is_ram(mr)) {
-        return !(is_write && mr->readonly);
-    }
-    if (memory_region_is_romd(mr)) {
-        return !is_write;
-    }
-
-    return false;
 }
 
 static int memory_access_size(MemoryRegion *mr, unsigned l, hwaddr addr)
@@ -2070,9 +2123,13 @@ void cpu_physical_memory_rw(hwaddr addr, uint8_t *buf,
     address_space_rw(&address_space_memory, addr, buf, len, is_write);
 }
 
-/* used for ROM loading : can write in RAM and ROM */
-void cpu_physical_memory_write_rom(hwaddr addr,
-                                   const uint8_t *buf, int len)
+enum write_rom_type {
+    WRITE_DATA,
+    FLUSH_CACHE,
+};
+
+static inline void cpu_physical_memory_write_rom_internal(AddressSpace *as,
+    hwaddr addr, const uint8_t *buf, int len, enum write_rom_type type)
 {
     hwaddr l;
     uint8_t *ptr;
@@ -2081,8 +2138,7 @@ void cpu_physical_memory_write_rom(hwaddr addr,
 
     while (len > 0) {
         l = len;
-        mr = address_space_translate(&address_space_memory,
-                                     addr, &addr1, &l, true);
+        mr = address_space_translate(as, addr, &addr1, &l, true);
 
         if (!(memory_region_is_ram(mr) ||
               memory_region_is_romd(mr))) {
@@ -2091,13 +2147,43 @@ void cpu_physical_memory_write_rom(hwaddr addr,
             addr1 += memory_region_get_ram_addr(mr);
             /* ROM/RAM case */
             ptr = qemu_get_ram_ptr(addr1);
-            memcpy(ptr, buf, l);
-            invalidate_and_set_dirty(addr1, l);
+            switch (type) {
+            case WRITE_DATA:
+                memcpy(ptr, buf, l);
+                invalidate_and_set_dirty(addr1, l);
+                break;
+            case FLUSH_CACHE:
+                flush_icache_range((uintptr_t)ptr, (uintptr_t)ptr + l);
+                break;
+            }
         }
         len -= l;
         buf += l;
         addr += l;
     }
+}
+
+/* used for ROM loading : can write in RAM and ROM */
+void cpu_physical_memory_write_rom(AddressSpace *as, hwaddr addr,
+                                   const uint8_t *buf, int len)
+{
+    cpu_physical_memory_write_rom_internal(as, addr, buf, len, WRITE_DATA);
+}
+
+void cpu_flush_icache_range(hwaddr start, int len)
+{
+    /*
+     * This function should do the same thing as an icache flush that was
+     * triggered from within the guest. For TCG we are always cache coherent,
+     * so there is no need to flush anything. For KVM / Xen we need to flush
+     * the host's instruction cache at least.
+     */
+    if (tcg_enabled()) {
+        return;
+    }
+
+    cpu_physical_memory_write_rom_internal(&address_space_memory,
+                                           start, NULL, len, FLUSH_CACHE);
 }
 
 typedef struct {
@@ -2288,7 +2374,7 @@ void cpu_physical_memory_unmap(void *buffer, hwaddr len,
 }
 
 /* warning: addr must be aligned */
-static inline uint32_t ldl_phys_internal(hwaddr addr,
+static inline uint32_t ldl_phys_internal(AddressSpace *as, hwaddr addr,
                                          enum device_endian endian)
 {
     uint8_t *ptr;
@@ -2297,8 +2383,7 @@ static inline uint32_t ldl_phys_internal(hwaddr addr,
     hwaddr l = 4;
     hwaddr addr1;
 
-    mr = address_space_translate(&address_space_memory, addr, &addr1, &l,
-                                 false);
+    mr = address_space_translate(as, addr, &addr1, &l, false);
     if (l < 4 || !memory_access_is_direct(mr, false)) {
         /* I/O case */
         io_mem_read(mr, addr1, &val, 4);
@@ -2331,23 +2416,23 @@ static inline uint32_t ldl_phys_internal(hwaddr addr,
     return val;
 }
 
-uint32_t ldl_phys(hwaddr addr)
+uint32_t ldl_phys(AddressSpace *as, hwaddr addr)
 {
-    return ldl_phys_internal(addr, DEVICE_NATIVE_ENDIAN);
+    return ldl_phys_internal(as, addr, DEVICE_NATIVE_ENDIAN);
 }
 
-uint32_t ldl_le_phys(hwaddr addr)
+uint32_t ldl_le_phys(AddressSpace *as, hwaddr addr)
 {
-    return ldl_phys_internal(addr, DEVICE_LITTLE_ENDIAN);
+    return ldl_phys_internal(as, addr, DEVICE_LITTLE_ENDIAN);
 }
 
-uint32_t ldl_be_phys(hwaddr addr)
+uint32_t ldl_be_phys(AddressSpace *as, hwaddr addr)
 {
-    return ldl_phys_internal(addr, DEVICE_BIG_ENDIAN);
+    return ldl_phys_internal(as, addr, DEVICE_BIG_ENDIAN);
 }
 
 /* warning: addr must be aligned */
-static inline uint64_t ldq_phys_internal(hwaddr addr,
+static inline uint64_t ldq_phys_internal(AddressSpace *as, hwaddr addr,
                                          enum device_endian endian)
 {
     uint8_t *ptr;
@@ -2356,7 +2441,7 @@ static inline uint64_t ldq_phys_internal(hwaddr addr,
     hwaddr l = 8;
     hwaddr addr1;
 
-    mr = address_space_translate(&address_space_memory, addr, &addr1, &l,
+    mr = address_space_translate(as, addr, &addr1, &l,
                                  false);
     if (l < 8 || !memory_access_is_direct(mr, false)) {
         /* I/O case */
@@ -2390,31 +2475,31 @@ static inline uint64_t ldq_phys_internal(hwaddr addr,
     return val;
 }
 
-uint64_t ldq_phys(hwaddr addr)
+uint64_t ldq_phys(AddressSpace *as, hwaddr addr)
 {
-    return ldq_phys_internal(addr, DEVICE_NATIVE_ENDIAN);
+    return ldq_phys_internal(as, addr, DEVICE_NATIVE_ENDIAN);
 }
 
-uint64_t ldq_le_phys(hwaddr addr)
+uint64_t ldq_le_phys(AddressSpace *as, hwaddr addr)
 {
-    return ldq_phys_internal(addr, DEVICE_LITTLE_ENDIAN);
+    return ldq_phys_internal(as, addr, DEVICE_LITTLE_ENDIAN);
 }
 
-uint64_t ldq_be_phys(hwaddr addr)
+uint64_t ldq_be_phys(AddressSpace *as, hwaddr addr)
 {
-    return ldq_phys_internal(addr, DEVICE_BIG_ENDIAN);
+    return ldq_phys_internal(as, addr, DEVICE_BIG_ENDIAN);
 }
 
 /* XXX: optimize */
-uint32_t ldub_phys(hwaddr addr)
+uint32_t ldub_phys(AddressSpace *as, hwaddr addr)
 {
     uint8_t val;
-    cpu_physical_memory_read(addr, &val, 1);
+    address_space_rw(as, addr, &val, 1, 0);
     return val;
 }
 
 /* warning: addr must be aligned */
-static inline uint32_t lduw_phys_internal(hwaddr addr,
+static inline uint32_t lduw_phys_internal(AddressSpace *as, hwaddr addr,
                                           enum device_endian endian)
 {
     uint8_t *ptr;
@@ -2423,7 +2508,7 @@ static inline uint32_t lduw_phys_internal(hwaddr addr,
     hwaddr l = 2;
     hwaddr addr1;
 
-    mr = address_space_translate(&address_space_memory, addr, &addr1, &l,
+    mr = address_space_translate(as, addr, &addr1, &l,
                                  false);
     if (l < 2 || !memory_access_is_direct(mr, false)) {
         /* I/O case */
@@ -2457,32 +2542,32 @@ static inline uint32_t lduw_phys_internal(hwaddr addr,
     return val;
 }
 
-uint32_t lduw_phys(hwaddr addr)
+uint32_t lduw_phys(AddressSpace *as, hwaddr addr)
 {
-    return lduw_phys_internal(addr, DEVICE_NATIVE_ENDIAN);
+    return lduw_phys_internal(as, addr, DEVICE_NATIVE_ENDIAN);
 }
 
-uint32_t lduw_le_phys(hwaddr addr)
+uint32_t lduw_le_phys(AddressSpace *as, hwaddr addr)
 {
-    return lduw_phys_internal(addr, DEVICE_LITTLE_ENDIAN);
+    return lduw_phys_internal(as, addr, DEVICE_LITTLE_ENDIAN);
 }
 
-uint32_t lduw_be_phys(hwaddr addr)
+uint32_t lduw_be_phys(AddressSpace *as, hwaddr addr)
 {
-    return lduw_phys_internal(addr, DEVICE_BIG_ENDIAN);
+    return lduw_phys_internal(as, addr, DEVICE_BIG_ENDIAN);
 }
 
 /* warning: addr must be aligned. The ram page is not masked as dirty
    and the code inside is not invalidated. It is useful if the dirty
    bits are used to track modified PTEs */
-void stl_phys_notdirty(hwaddr addr, uint32_t val)
+void stl_phys_notdirty(AddressSpace *as, hwaddr addr, uint32_t val)
 {
     uint8_t *ptr;
     MemoryRegion *mr;
     hwaddr l = 4;
     hwaddr addr1;
 
-    mr = address_space_translate(&address_space_memory, addr, &addr1, &l,
+    mr = address_space_translate(as, addr, &addr1, &l,
                                  true);
     if (l < 4 || !memory_access_is_direct(mr, true)) {
         io_mem_write(mr, addr1, val, 4);
@@ -2492,19 +2577,21 @@ void stl_phys_notdirty(hwaddr addr, uint32_t val)
         stl_p(ptr, val);
 
         if (unlikely(in_migration)) {
-            if (!cpu_physical_memory_is_dirty(addr1)) {
+            if (cpu_physical_memory_is_clean(addr1)) {
                 /* invalidate code */
                 tb_invalidate_phys_page_range(addr1, addr1 + 4, 0);
                 /* set dirty bit */
-                cpu_physical_memory_set_dirty_flags(
-                    addr1, (0xff & ~CODE_DIRTY_FLAG));
+                cpu_physical_memory_set_dirty_flag(addr1,
+                                                   DIRTY_MEMORY_MIGRATION);
+                cpu_physical_memory_set_dirty_flag(addr1, DIRTY_MEMORY_VGA);
             }
         }
     }
 }
 
 /* warning: addr must be aligned */
-static inline void stl_phys_internal(hwaddr addr, uint32_t val,
+static inline void stl_phys_internal(AddressSpace *as,
+                                     hwaddr addr, uint32_t val,
                                      enum device_endian endian)
 {
     uint8_t *ptr;
@@ -2512,7 +2599,7 @@ static inline void stl_phys_internal(hwaddr addr, uint32_t val,
     hwaddr l = 4;
     hwaddr addr1;
 
-    mr = address_space_translate(&address_space_memory, addr, &addr1, &l,
+    mr = address_space_translate(as, addr, &addr1, &l,
                                  true);
     if (l < 4 || !memory_access_is_direct(mr, true)) {
 #if defined(TARGET_WORDS_BIGENDIAN)
@@ -2544,30 +2631,31 @@ static inline void stl_phys_internal(hwaddr addr, uint32_t val,
     }
 }
 
-void stl_phys(hwaddr addr, uint32_t val)
+void stl_phys(AddressSpace *as, hwaddr addr, uint32_t val)
 {
-    stl_phys_internal(addr, val, DEVICE_NATIVE_ENDIAN);
+    stl_phys_internal(as, addr, val, DEVICE_NATIVE_ENDIAN);
 }
 
-void stl_le_phys(hwaddr addr, uint32_t val)
+void stl_le_phys(AddressSpace *as, hwaddr addr, uint32_t val)
 {
-    stl_phys_internal(addr, val, DEVICE_LITTLE_ENDIAN);
+    stl_phys_internal(as, addr, val, DEVICE_LITTLE_ENDIAN);
 }
 
-void stl_be_phys(hwaddr addr, uint32_t val)
+void stl_be_phys(AddressSpace *as, hwaddr addr, uint32_t val)
 {
-    stl_phys_internal(addr, val, DEVICE_BIG_ENDIAN);
+    stl_phys_internal(as, addr, val, DEVICE_BIG_ENDIAN);
 }
 
 /* XXX: optimize */
-void stb_phys(hwaddr addr, uint32_t val)
+void stb_phys(AddressSpace *as, hwaddr addr, uint32_t val)
 {
     uint8_t v = val;
-    cpu_physical_memory_write(addr, &v, 1);
+    address_space_rw(as, addr, &v, 1, 1);
 }
 
 /* warning: addr must be aligned */
-static inline void stw_phys_internal(hwaddr addr, uint32_t val,
+static inline void stw_phys_internal(AddressSpace *as,
+                                     hwaddr addr, uint32_t val,
                                      enum device_endian endian)
 {
     uint8_t *ptr;
@@ -2575,8 +2663,7 @@ static inline void stw_phys_internal(hwaddr addr, uint32_t val,
     hwaddr l = 2;
     hwaddr addr1;
 
-    mr = address_space_translate(&address_space_memory, addr, &addr1, &l,
-                                 true);
+    mr = address_space_translate(as, addr, &addr1, &l, true);
     if (l < 2 || !memory_access_is_direct(mr, true)) {
 #if defined(TARGET_WORDS_BIGENDIAN)
         if (endian == DEVICE_LITTLE_ENDIAN) {
@@ -2607,38 +2694,38 @@ static inline void stw_phys_internal(hwaddr addr, uint32_t val,
     }
 }
 
-void stw_phys(hwaddr addr, uint32_t val)
+void stw_phys(AddressSpace *as, hwaddr addr, uint32_t val)
 {
-    stw_phys_internal(addr, val, DEVICE_NATIVE_ENDIAN);
+    stw_phys_internal(as, addr, val, DEVICE_NATIVE_ENDIAN);
 }
 
-void stw_le_phys(hwaddr addr, uint32_t val)
+void stw_le_phys(AddressSpace *as, hwaddr addr, uint32_t val)
 {
-    stw_phys_internal(addr, val, DEVICE_LITTLE_ENDIAN);
+    stw_phys_internal(as, addr, val, DEVICE_LITTLE_ENDIAN);
 }
 
-void stw_be_phys(hwaddr addr, uint32_t val)
+void stw_be_phys(AddressSpace *as, hwaddr addr, uint32_t val)
 {
-    stw_phys_internal(addr, val, DEVICE_BIG_ENDIAN);
+    stw_phys_internal(as, addr, val, DEVICE_BIG_ENDIAN);
 }
 
 /* XXX: optimize */
-void stq_phys(hwaddr addr, uint64_t val)
+void stq_phys(AddressSpace *as, hwaddr addr, uint64_t val)
 {
     val = tswap64(val);
-    cpu_physical_memory_write(addr, &val, 8);
+    address_space_rw(as, addr, (void *) &val, 8, 1);
 }
 
-void stq_le_phys(hwaddr addr, uint64_t val)
+void stq_le_phys(AddressSpace *as, hwaddr addr, uint64_t val)
 {
     val = cpu_to_le64(val);
-    cpu_physical_memory_write(addr, &val, 8);
+    address_space_rw(as, addr, (void *) &val, 8, 1);
 }
 
-void stq_be_phys(hwaddr addr, uint64_t val)
+void stq_be_phys(AddressSpace *as, hwaddr addr, uint64_t val)
 {
     val = cpu_to_be64(val);
-    cpu_physical_memory_write(addr, &val, 8);
+    address_space_rw(as, addr, (void *) &val, 8, 1);
 }
 
 /* virtual memory access for debug (includes writing to ROM) */
@@ -2659,10 +2746,11 @@ int cpu_memory_rw_debug(CPUState *cpu, target_ulong addr,
         if (l > len)
             l = len;
         phys_addr += (addr & ~TARGET_PAGE_MASK);
-        if (is_write)
-            cpu_physical_memory_write_rom(phys_addr, buf, l);
-        else
-            cpu_physical_memory_rw(phys_addr, buf, l, is_write);
+        if (is_write) {
+            cpu_physical_memory_write_rom(cpu->as, phys_addr, buf, l);
+        } else {
+            address_space_rw(cpu->as, phys_addr, buf, l, 0);
+        }
         len -= l;
         buf += l;
         addr += l;
@@ -2671,14 +2759,12 @@ int cpu_memory_rw_debug(CPUState *cpu, target_ulong addr,
 }
 #endif
 
-#if !defined(CONFIG_USER_ONLY)
-
 /*
  * A helper function for the _utterly broken_ virtio device model to find out if
  * it's running on a big endian machine. Don't do this at home kids!
  */
-bool virtio_is_big_endian(void);
-bool virtio_is_big_endian(void)
+bool target_words_bigendian(void);
+bool target_words_bigendian(void)
 {
 #if defined(TARGET_WORDS_BIGENDIAN)
     return true;
@@ -2686,8 +2772,6 @@ bool virtio_is_big_endian(void)
     return false;
 #endif
 }
-
-#endif
 
 #ifndef CONFIG_USER_ONLY
 bool cpu_physical_memory_is_io(hwaddr phys_addr)

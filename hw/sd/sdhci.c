@@ -26,7 +26,6 @@
 #include "sysemu/blockdev.h"
 #include "sysemu/dma.h"
 #include "qemu/timer.h"
-#include "block/block_int.h"
 #include "qemu/bitops.h"
 
 #include "sdhci.h"
@@ -1198,7 +1197,7 @@ const VMStateDescription sdhci_vmstate = {
     .name = "sdhci",
     .version_id = 1,
     .minimum_version_id = 1,
-    .fields      = (VMStateField[]) {
+    .fields = (VMStateField[]) {
         VMSTATE_UINT32(sdmasysad, SDHCIState),
         VMSTATE_UINT16(blksize, SDHCIState),
         VMSTATE_UINT16(blkcnt, SDHCIState),
@@ -1234,9 +1233,9 @@ const VMStateDescription sdhci_vmstate = {
 /* Capabilities registers provide information on supported features of this
  * specific host controller implementation */
 static Property sdhci_properties[] = {
-    DEFINE_PROP_HEX32("capareg", SDHCIState, capareg,
+    DEFINE_PROP_UINT32("capareg", SDHCIState, capareg,
             SDHC_CAPAB_REG_DEFAULT),
-    DEFINE_PROP_HEX32("maxcurr", SDHCIState, maxcurr, 0),
+    DEFINE_PROP_UINT32("maxcurr", SDHCIState, maxcurr, 0),
     DEFINE_PROP_END_OF_LIST(),
 };
 

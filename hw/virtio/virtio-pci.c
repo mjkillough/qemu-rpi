@@ -89,9 +89,6 @@
 /* Flags track per-device state like workarounds for quirks in older guests. */
 #define VIRTIO_PCI_FLAG_BUS_MASTER_BUG  (1 << 0)
 
-/* HACK for virtio to determine if it's running a big endian guest */
-bool virtio_is_big_endian(void);
-
 static void virtio_pci_bus_new(VirtioBusState *bus, size_t bus_size,
                                VirtIOPCIProxy *dev);
 
@@ -409,13 +406,13 @@ static uint64_t virtio_pci_config_read(void *opaque, hwaddr addr,
         break;
     case 2:
         val = virtio_config_readw(vdev, addr);
-        if (virtio_is_big_endian()) {
+        if (virtio_is_big_endian(vdev)) {
             val = bswap16(val);
         }
         break;
     case 4:
         val = virtio_config_readl(vdev, addr);
-        if (virtio_is_big_endian()) {
+        if (virtio_is_big_endian(vdev)) {
             val = bswap32(val);
         }
         break;
@@ -443,13 +440,13 @@ static void virtio_pci_config_write(void *opaque, hwaddr addr,
         virtio_config_writeb(vdev, addr, val);
         break;
     case 2:
-        if (virtio_is_big_endian()) {
+        if (virtio_is_big_endian(vdev)) {
             val = bswap16(val);
         }
         virtio_config_writew(vdev, addr, val);
         break;
     case 4:
-        if (virtio_is_big_endian()) {
+        if (virtio_is_big_endian(vdev)) {
             val = bswap32(val);
         }
         virtio_config_writel(vdev, addr, val);
@@ -976,6 +973,8 @@ static void virtio_pci_device_plugged(DeviceState *d)
 
     if (proxy->nvectors &&
         msix_init_exclusive_bar(&proxy->pci_dev, proxy->nvectors, 1)) {
+        error_report("unable to init msix vectors to %" PRIu32,
+                     proxy->nvectors);
         proxy->nvectors = 0;
     }
 
@@ -1063,7 +1062,7 @@ static const TypeInfo virtio_pci_info = {
 /* virtio-blk-pci */
 
 static Property virtio_blk_pci_properties[] = {
-    DEFINE_PROP_HEX32("class", VirtIOPCIProxy, class_code, 0),
+    DEFINE_PROP_UINT32("class", VirtIOPCIProxy, class_code, 0),
     DEFINE_PROP_BIT("ioeventfd", VirtIOPCIProxy, flags,
                     VIRTIO_PCI_FLAG_USE_IOEVENTFD_BIT, true),
     DEFINE_PROP_UINT32("vectors", VirtIOPCIProxy, nvectors, 2),
@@ -1275,7 +1274,7 @@ static void balloon_pci_stats_set_poll_interval(Object *obj, struct Visitor *v,
 
 static Property virtio_balloon_pci_properties[] = {
     DEFINE_VIRTIO_COMMON_FEATURES(VirtIOPCIProxy, host_features),
-    DEFINE_PROP_HEX32("class", VirtIOPCIProxy, class_code, 0),
+    DEFINE_PROP_UINT32("class", VirtIOPCIProxy, class_code, 0),
     DEFINE_PROP_END_OF_LIST(),
 };
 
@@ -1376,7 +1375,7 @@ static Property virtio_serial_pci_properties[] = {
     DEFINE_PROP_BIT("ioeventfd", VirtIOPCIProxy, flags,
                     VIRTIO_PCI_FLAG_USE_IOEVENTFD_BIT, true),
     DEFINE_PROP_UINT32("vectors", VirtIOPCIProxy, nvectors, 2),
-    DEFINE_PROP_HEX32("class", VirtIOPCIProxy, class_code, 0),
+    DEFINE_PROP_UINT32("class", VirtIOPCIProxy, class_code, 0),
     DEFINE_VIRTIO_COMMON_FEATURES(VirtIOPCIProxy, host_features),
     DEFINE_VIRTIO_SERIAL_PROPERTIES(VirtIOSerialPCI, vdev.serial),
     DEFINE_PROP_END_OF_LIST(),
@@ -1517,7 +1516,9 @@ static void virtio_rng_initfn(Object *obj)
     object_initialize(&dev->vdev, sizeof(dev->vdev), TYPE_VIRTIO_RNG);
     object_property_add_child(obj, "virtio-backend", OBJECT(&dev->vdev), NULL);
     object_property_add_link(obj, "rng", TYPE_RNG_BACKEND,
-                             (Object **)&dev->vdev.conf.rng, NULL);
+                             (Object **)&dev->vdev.conf.rng,
+                             qdev_prop_allow_set_link_before_realize,
+                             OBJ_PROP_LINK_UNREF_ON_RELEASE, NULL);
 
 }
 

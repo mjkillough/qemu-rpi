@@ -60,7 +60,7 @@ static void close_unused_images(BlockDriverState *top, BlockDriverState *base,
     /* Must assign before bdrv_delete() to prevent traversing dangling pointer
      * while we delete backing image instances.
      */
-    top->backing_hd = base;
+    bdrv_set_backing_hd(top, base);
 
     while (intermediate) {
         BlockDriverState *unused;
@@ -72,9 +72,11 @@ static void close_unused_images(BlockDriverState *top, BlockDriverState *base,
 
         unused = intermediate;
         intermediate = intermediate->backing_hd;
-        unused->backing_hd = NULL;
+        bdrv_set_backing_hd(unused, NULL);
         bdrv_unref(unused);
     }
+
+    bdrv_refresh_limits(top);
 }
 
 static void coroutine_fn stream_run(void *opaque)
@@ -157,14 +159,14 @@ wait:
             BlockErrorAction action =
                 block_job_error_action(&s->common, s->common.bs, s->on_error,
                                        true, -ret);
-            if (action == BDRV_ACTION_STOP) {
+            if (action == BLOCK_ERROR_ACTION_STOP) {
                 n = 0;
                 continue;
             }
             if (error == 0) {
                 error = ret;
             }
-            if (action == BDRV_ACTION_REPORT) {
+            if (action == BLOCK_ERROR_ACTION_REPORT) {
                 break;
             }
         }

@@ -45,6 +45,8 @@ enum vhd_type {
 // Seconds since Jan 1, 2000 0:00:00 (UTC)
 #define VHD_TIMESTAMP_BASE 946684800
 
+#define VHD_MAX_SECTORS       (65535LL * 255 * 255)
+
 // always big-endian
 typedef struct vhd_footer {
     char        creator[8]; // "conectix"
@@ -164,6 +166,7 @@ static int vpc_open(BlockDriverState *bs, QDict *options, int flags,
     VHDDynDiskHeader *dyndisk_header;
     uint8_t buf[HEADER_SIZE];
     uint32_t checksum;
+    uint64_t computed_size;
     int disk_type = VHD_DYNAMIC;
     int ret;
 
@@ -190,7 +193,8 @@ static int vpc_open(BlockDriverState *bs, QDict *options, int flags,
             goto fail;
         }
         if (strncmp(footer->creator, "conectix", 8)) {
-            ret = -EMEDIUMTYPE;
+            error_setg(errp, "invalid VPC image");
+            ret = -EINVAL;
             goto fail;
         }
         disk_type = VHD_FIXED;
@@ -221,7 +225,7 @@ static int vpc_open(BlockDriverState *bs, QDict *options, int flags,
     }
 
     /* Allow a maximum disk size of approximately 2 TB */
-    if (bs->total_sectors >= 65535LL * 255 * 255) {
+    if (bs->total_sectors >= VHD_MAX_SECTORS) {
         ret = -EFBIG;
         goto fail;
     }
@@ -241,10 +245,31 @@ static int vpc_open(BlockDriverState *bs, QDict *options, int flags,
         }
 
         s->block_size = be32_to_cpu(dyndisk_header->block_size);
+        if (!is_power_of_2(s->block_size) || s->block_size < BDRV_SECTOR_SIZE) {
+            error_setg(errp, "Invalid block size %" PRIu32, s->block_size);
+            ret = -EINVAL;
+            goto fail;
+        }
         s->bitmap_size = ((s->block_size / (8 * 512)) + 511) & ~511;
 
         s->max_table_entries = be32_to_cpu(dyndisk_header->max_table_entries);
-        s->pagetable = g_malloc(s->max_table_entries * 4);
+
+        if ((bs->total_sectors * 512) / s->block_size > 0xffffffffU) {
+            ret = -EINVAL;
+            goto fail;
+        }
+        if (s->max_table_entries > (VHD_MAX_SECTORS * 512) / s->block_size) {
+            ret = -EINVAL;
+            goto fail;
+        }
+
+        computed_size = (uint64_t) s->max_table_entries * s->block_size;
+        if (computed_size < bs->total_sectors * 512) {
+            ret = -EINVAL;
+            goto fail;
+        }
+
+        s->pagetable = qemu_blockalign(bs, s->max_table_entries * 4);
 
         s->bat_offset = be64_to_cpu(dyndisk_header->table_offset);
 
@@ -297,7 +322,7 @@ static int vpc_open(BlockDriverState *bs, QDict *options, int flags,
     return 0;
 
 fail:
-    g_free(s->pagetable);
+    qemu_vfree(s->pagetable);
 #ifdef CACHE
     g_free(s->pageentry_u8);
 #endif
@@ -713,12 +738,11 @@ static int create_fixed_disk(int fd, uint8_t *buf, int64_t total_size)
     return ret;
 }
 
-static int vpc_create(const char *filename, QEMUOptionParameter *options,
-                      Error **errp)
+static int vpc_create(const char *filename, QemuOpts *opts, Error **errp)
 {
     uint8_t buf[1024];
     VHDFooter *footer = (VHDFooter *) buf;
-    QEMUOptionParameter *disk_type_param;
+    char *disk_type_param;
     int fd, i;
     uint16_t cyls = 0;
     uint8_t heads = 0;
@@ -729,16 +753,16 @@ static int vpc_create(const char *filename, QEMUOptionParameter *options,
     int ret = -EIO;
 
     /* Read out options */
-    total_size = get_option_parameter(options, BLOCK_OPT_SIZE)->value.n;
-
-    disk_type_param = get_option_parameter(options, BLOCK_OPT_SUBFMT);
-    if (disk_type_param && disk_type_param->value.s) {
-        if (!strcmp(disk_type_param->value.s, "dynamic")) {
+    total_size = qemu_opt_get_size_del(opts, BLOCK_OPT_SIZE, 0);
+    disk_type_param = qemu_opt_get_del(opts, BLOCK_OPT_SUBFMT);
+    if (disk_type_param) {
+        if (!strcmp(disk_type_param, "dynamic")) {
             disk_type = VHD_DYNAMIC;
-        } else if (!strcmp(disk_type_param->value.s, "fixed")) {
+        } else if (!strcmp(disk_type_param, "fixed")) {
             disk_type = VHD_FIXED;
         } else {
-            return -EINVAL;
+            ret = -EINVAL;
+            goto out;
         }
     } else {
         disk_type = VHD_DYNAMIC;
@@ -747,7 +771,8 @@ static int vpc_create(const char *filename, QEMUOptionParameter *options,
     /* Create the file */
     fd = qemu_open(filename, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0644);
     if (fd < 0) {
-        return -EIO;
+        ret = -EIO;
+        goto out;
     }
 
     /*
@@ -812,8 +837,10 @@ static int vpc_create(const char *filename, QEMUOptionParameter *options,
         ret = create_fixed_disk(fd, buf, total_size);
     }
 
- fail:
+fail:
     qemu_close(fd);
+out:
+    g_free(disk_type_param);
     return ret;
 }
 
@@ -832,7 +859,7 @@ static int vpc_has_zero_init(BlockDriverState *bs)
 static void vpc_close(BlockDriverState *bs)
 {
     BDRVVPCState *s = bs->opaque;
-    g_free(s->pagetable);
+    qemu_vfree(s->pagetable);
 #ifdef CACHE
     g_free(s->pageentry_u8);
 #endif
@@ -841,20 +868,24 @@ static void vpc_close(BlockDriverState *bs)
     error_free(s->migration_blocker);
 }
 
-static QEMUOptionParameter vpc_create_options[] = {
-    {
-        .name = BLOCK_OPT_SIZE,
-        .type = OPT_SIZE,
-        .help = "Virtual disk size"
-    },
-    {
-        .name = BLOCK_OPT_SUBFMT,
-        .type = OPT_STRING,
-        .help =
-            "Type of virtual hard disk format. Supported formats are "
-            "{dynamic (default) | fixed} "
-    },
-    { NULL }
+static QemuOptsList vpc_create_opts = {
+    .name = "vpc-create-opts",
+    .head = QTAILQ_HEAD_INITIALIZER(vpc_create_opts.head),
+    .desc = {
+        {
+            .name = BLOCK_OPT_SIZE,
+            .type = QEMU_OPT_SIZE,
+            .help = "Virtual disk size"
+        },
+        {
+            .name = BLOCK_OPT_SUBFMT,
+            .type = QEMU_OPT_STRING,
+            .help =
+                "Type of virtual hard disk format. Supported formats are "
+                "{dynamic (default) | fixed} "
+        },
+        { /* end of list */ }
+    }
 };
 
 static BlockDriver bdrv_vpc = {
@@ -872,7 +903,7 @@ static BlockDriver bdrv_vpc = {
 
     .bdrv_get_info          = vpc_get_info,
 
-    .create_options         = vpc_create_options,
+    .create_opts            = &vpc_create_opts,
     .bdrv_has_zero_init     = vpc_has_zero_init,
 };
 

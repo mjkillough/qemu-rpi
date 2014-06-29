@@ -203,7 +203,7 @@ static const VMStateDescription vmstate_i440fx = {
     .minimum_version_id_old = 1,
     .load_state_old = i440fx_load_old,
     .post_load = i440fx_post_load,
-    .fields      = (VMStateField []) {
+    .fields = (VMStateField[]) {
         VMSTATE_PCI_DEVICE(parent_obj, PCII440FXState),
         VMSTATE_UINT8(smm_enabled, PCII440FXState),
         VMSTATE_END_OF_LIST()
@@ -311,6 +311,7 @@ PCIBus *i440fx_init(PCII440FXState **pi440fx_state,
                     MemoryRegion *address_space_mem,
                     MemoryRegion *address_space_io,
                     ram_addr_t ram_size,
+                    ram_addr_t below_4g_mem_size,
                     ram_addr_t above_4g_mem_size,
                     MemoryRegion *pci_address_space,
                     MemoryRegion *ram_memory)
@@ -340,15 +341,7 @@ PCIBus *i440fx_init(PCII440FXState **pi440fx_state,
     f->ram_memory = ram_memory;
 
     i440fx = I440FX_PCI_HOST_BRIDGE(dev);
-    /* Set PCI window size the way seabios has always done it. */
-    /* Power of 2 so bios can cover it with a single MTRR */
-    if (ram_size <= 0x80000000) {
-        i440fx->pci_info.w32.begin = 0x80000000;
-    } else if (ram_size <= 0xc0000000) {
-        i440fx->pci_info.w32.begin = 0xc0000000;
-    } else {
-        i440fx->pci_info.w32.begin = 0xe0000000;
-    }
+    i440fx->pci_info.w32.begin = below_4g_mem_size;
 
     /* setup pci memory mapping */
     pc_pci_as_mapping_init(OBJECT(f), f->system_memory,
@@ -560,7 +553,7 @@ static const VMStateDescription vmstate_piix3_rcr = {
     .name = "PIIX3/rcr",
     .version_id = 1,
     .minimum_version_id = 1,
-    .fields = (VMStateField []) {
+    .fields = (VMStateField[]) {
         VMSTATE_UINT8(rcr, PIIX3State),
         VMSTATE_END_OF_LIST()
     }
@@ -570,10 +563,9 @@ static const VMStateDescription vmstate_piix3 = {
     .name = "PIIX3",
     .version_id = 3,
     .minimum_version_id = 2,
-    .minimum_version_id_old = 2,
     .post_load = piix3_post_load,
     .pre_save = piix3_pre_save,
-    .fields      = (VMStateField[]) {
+    .fields = (VMStateField[]) {
         VMSTATE_PCI_DEVICE(dev, PIIX3State),
         VMSTATE_INT32_ARRAY_V(pci_irq_levels_vmstate, PIIX3State,
                               PIIX_NUM_PIRQS, 3),
@@ -635,14 +627,18 @@ static void piix3_class_init(ObjectClass *klass, void *data)
 
     dc->desc        = "ISA bridge";
     dc->vmsd        = &vmstate_piix3;
-    dc->no_user     = 1,
-    k->no_hotplug   = 1;
+    dc->hotpluggable   = false;
     k->init         = piix3_initfn;
     k->config_write = piix3_write_config;
     k->vendor_id    = PCI_VENDOR_ID_INTEL;
     /* 82371SB PIIX3 PCI-to-ISA bridge (Step A1) */
     k->device_id    = PCI_DEVICE_ID_INTEL_82371SB_0;
     k->class_id     = PCI_CLASS_BRIDGE_ISA;
+    /*
+     * Reason: part of PIIX3 southbridge, needs to be wired up by
+     * pc_piix.c's pc_init1()
+     */
+    dc->cannot_instantiate_with_device_add_yet = true;
 }
 
 static const TypeInfo piix3_info = {
@@ -659,14 +655,18 @@ static void piix3_xen_class_init(ObjectClass *klass, void *data)
 
     dc->desc        = "ISA bridge";
     dc->vmsd        = &vmstate_piix3;
-    dc->no_user     = 1;
-    k->no_hotplug   = 1;
+    dc->hotpluggable   = false;
     k->init         = piix3_initfn;
     k->config_write = piix3_write_config_xen;
     k->vendor_id    = PCI_VENDOR_ID_INTEL;
     /* 82371SB PIIX3 PCI-to-ISA bridge (Step A1) */
     k->device_id    = PCI_DEVICE_ID_INTEL_82371SB_0;
     k->class_id     = PCI_CLASS_BRIDGE_ISA;
+    /*
+     * Reason: part of PIIX3 southbridge, needs to be wired up by
+     * pc_piix.c's pc_init1()
+     */
+    dc->cannot_instantiate_with_device_add_yet = true;
 };
 
 static const TypeInfo piix3_xen_info = {
@@ -681,7 +681,6 @@ static void i440fx_class_init(ObjectClass *klass, void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
 
-    k->no_hotplug = 1;
     k->init = i440fx_initfn;
     k->config_write = i440fx_write_config;
     k->vendor_id = PCI_VENDOR_ID_INTEL;
@@ -689,8 +688,13 @@ static void i440fx_class_init(ObjectClass *klass, void *data)
     k->revision = 0x02;
     k->class_id = PCI_CLASS_BRIDGE_HOST;
     dc->desc = "Host bridge";
-    dc->no_user = 1;
     dc->vmsd = &vmstate_i440fx;
+    /*
+     * PCI-facing part of the host bridge, not usable without the
+     * host-facing part, which can't be device_add'ed, yet.
+     */
+    dc->cannot_instantiate_with_device_add_yet = true;
+    dc->hotpluggable   = false;
 }
 
 static const TypeInfo i440fx_info = {
@@ -727,7 +731,6 @@ static void i440fx_pcihost_class_init(ObjectClass *klass, void *data)
     hc->root_bus_path = i440fx_pcihost_root_bus_path;
     dc->realize = i440fx_pcihost_realize;
     dc->fw_name = "pci";
-    dc->no_user = 1;
     dc->props = i440fx_props;
 }
 

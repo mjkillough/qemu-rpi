@@ -194,17 +194,11 @@ void commit_start(BlockDriverState *bs, BlockDriverState *base,
     if ((on_error == BLOCKDEV_ON_ERROR_STOP ||
          on_error == BLOCKDEV_ON_ERROR_ENOSPC) &&
         !bdrv_iostatus_is_enabled(bs)) {
-        error_set(errp, QERR_INVALID_PARAMETER_COMBINATION);
+        error_setg(errp, "Invalid parameter combination");
         return;
     }
 
-    /* Once we support top == active layer, remove this check */
-    if (top == bs) {
-        error_setg(errp,
-                   "Top image as the active layer is currently unsupported");
-        return;
-    }
-
+    assert(top != bs);
     if (top == base) {
         error_setg(errp, "Invalid files for merge: top and base are the same");
         return;
