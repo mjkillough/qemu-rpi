@@ -66,7 +66,7 @@ uint32_t bootloader_100[] = {
 
 static struct arm_boot_info raspi_binfo;
 
-static void raspi_init(QEMUMachineInitArgs *args)
+static void raspi_init(MachineState *args)
 {
     ARMCPU *cpu;
     MemoryRegion *sysmem = get_system_memory();
@@ -329,10 +329,10 @@ static void raspi_init(QEMUMachineInitArgs *args)
         && !strcmp(args->kernel_filename, args->initrd_filename)) {
 
         for (n = 0; n < ARRAY_SIZE(bootloader_0); n++) {
-            stl_phys((n << 2), bootloader_0[n]);
+            stl_phys(&address_space_memory, (n << 2), bootloader_0[n]);
         }
         for (n = 0; n < ARRAY_SIZE(bootloader_100); n++) {
-            stl_phys(0x100 + (n << 2), bootloader_100[n]);
+            stl_phys(&address_space_memory, 0x100 + (n << 2), bootloader_100[n]);
         }
         load_image_targphys(args->initrd_filename,
                             0x8000,
