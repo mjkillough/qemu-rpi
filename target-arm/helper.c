@@ -508,6 +508,18 @@ static void cpacr_write(CPUARMState *env, const ARMCPRegInfo *ri,
     env->cp15.c1_coproc = value;
 }
 
+static void vbar_write(CPUARMState *env, const ARMCPRegInfo *ri,
+                       uint64_t value)
+{
+    /* Note that even though the AArch64 view of this register has bits
+     * [10:0] all RES0 we can only mask the bottom 5, to comply with the
+     * architectural requirements for bits which are RES0 only in some
+     * contexts. (ARMv8 would permit us to do no masking at all, but ARMv7
+     * requires the bottom five bits to be RAZ/WI because they're UNK/SBZP.)
+     */
+    raw_write(env, ri, value & ~0x1FULL);
+}
+
 static const ARMCPRegInfo v6_cp_reginfo[] = {
     /* prefetch by MVA in v6, NOP in v7 */
     { .name = "MVA_prefetch",
@@ -532,6 +544,11 @@ static const ARMCPRegInfo v6_cp_reginfo[] = {
       .crn = 1, .crm = 0, .opc1 = 0, .opc2 = 2,
       .access = PL1_RW, .fieldoffset = offsetof(CPUARMState, cp15.c1_coproc),
       .resetvalue = 0, .writefn = cpacr_write },
+    { .name = "VBAR", .state = ARM_CP_STATE_BOTH,
+      .opc0 = 3, .crn = 12, .crm = 0, .opc1 = 0, .opc2 = 0,
+      .access = PL1_RW, .writefn = vbar_write,
+      .fieldoffset = offsetof(CPUARMState, cp15.vbar_el[1]),
+      .resetvalue = 0 },
     REGINFO_SENTINEL
 };
 
@@ -670,18 +687,6 @@ static void pmintenclr_write(CPUARMState *env, const ARMCPRegInfo *ri,
 {
     value &= (1 << 31);
     env->cp15.c9_pminten &= ~value;
-}
-
-static void vbar_write(CPUARMState *env, const ARMCPRegInfo *ri,
-                       uint64_t value)
-{
-    /* Note that even though the AArch64 view of this register has bits
-     * [10:0] all RES0 we can only mask the bottom 5, to comply with the
-     * architectural requirements for bits which are RES0 only in some
-     * contexts. (ARMv8 would permit us to do no masking at all, but ARMv7
-     * requires the bottom five bits to be RAZ/WI because they're UNK/SBZP.)
-     */
-    raw_write(env, ri, value & ~0x1FULL);
 }
 
 static uint64_t ccsidr_read(CPUARMState *env, const ARMCPRegInfo *ri)
